@@ -1,4 +1,4 @@
-"""Module for downloading files and handling web interactions """
+"""Module for downloading files and handling web interactions"""
 
 import os
 import re
@@ -130,7 +130,7 @@ class DownloadManager:
                             )
                     print(f"\nFinished downloading {os.path.basename(filename)}.")
                     return True
-            except (requests.RequestException, IOError, OSError) as e:
+            except (requests.RequestException, OSError) as e:
                 print(
                     f"Error downloading {os.path.basename(filename)} (attempt {retry + 1}/{max_retries}): {e}"
                 )
