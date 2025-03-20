@@ -75,6 +75,8 @@ python3 index.py
 
     * If a download fails, the script will retry up to 6 times.
 
+    * The downloaded files will be in /downloads folder inside the project folder
+
 ## Example
 
 ```bash
