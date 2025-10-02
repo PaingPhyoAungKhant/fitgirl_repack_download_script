@@ -1,6 +1,7 @@
 """Module for downloading files and handling web interactions"""
 
 import time
+from typing import List
 from bs4 import BeautifulSoup
 from web_driver_manager import WebDriverManager
 
@@ -28,13 +29,24 @@ class LinkExtractor:
             new_url = input("Enter new URL: ")
             return LinkExtractor(new_url).get_all_links()
 
-        ul = div_plaintext.find("ul")
-        if not ul:
+        uls: List = div_plaintext.find_all("ul")
+        if not uls:
             print("No <ul> element found within the div.")
             return []
 
-        return [
-            a["href"]
-            for li in ul.find_all("li")
-            if (a := li.find("a")) and "href" in a.attrs
-        ]
+        links: list[str] = []
+        for ul in uls:
+            for li in ul.find_all("li"):
+                a = li.find("a")
+                if a and "href" in a.attrs:
+                    href = a["href"].strip()
+                    if href and href.startswith("http"):
+                        links.append(href)
+        # De-duplicate while preserving order
+        seen = set()
+        unique_links: list[str] = []
+        for link in links:
+            if link not in seen:
+                seen.add(link)
+                unique_links.append(link)
+        return unique_links
