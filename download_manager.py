@@ -3,7 +3,10 @@
 import os
 import re
 import time
+import random
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from selenium.webdriver.common.by import By
 from link_extractor import LinkExtractor
 from web_driver_manager import WebDriverManager
@@ -15,6 +18,27 @@ class DownloadManager:
     def __init__(self, download_dir: str = "downloads"):
         self.download_dir = download_dir
         os.makedirs(self.download_dir, exist_ok=True)
+        # Create a reusable HTTP session with connection pooling and retries
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            }
+        )
+        retry_cfg = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["HEAD", "GET", "OPTIONS"]),
+        )
+        adapter = HTTPAdapter(max_retries=retry_cfg, pool_connections=10, pool_maxsize=10)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def get_wait_time(self) -> int:
         """Prompt the user for wait time between downloads."""
@@ -53,11 +77,13 @@ class DownloadManager:
                     continue
 
                 print(f"Starting download for {filename}...")
-                if not self.download_file(download_link, filepath):
+                if not self.download_file(download_link, filepath, session=self.session):
                     failed_downloads.append(link)
 
-                print(f"Waiting {wait_time} seconds until the next download...")
-                time.sleep(wait_time)
+                # Add small jitter to avoid detectable fixed timing
+                jittered_wait = max(0, wait_time * random.uniform(0.8, 1.2))
+                print(f"Waiting {jittered_wait:.1f} seconds until the next download...")
+                time.sleep(jittered_wait)
             except (requests.RequestException, ValueError) as e:
                 print(f"Failed to process {link}: {e}")
                 failed_downloads.append(link)
@@ -90,12 +116,23 @@ class DownloadManager:
 
     @staticmethod
     def extract_url(js_code: str) -> str:
-        """Extract the URL from JavaScript code."""
-        pattern = r'window\.open\("([^"]+)"'
-        url_match = re.search(pattern, js_code)
-        if not url_match:
-            raise ValueError("Could not find the download URL in the script.")
-        return url_match.group(1)
+        """Extract the URL from JavaScript code.
+
+        Supports patterns like:
+        - window.open('URL')
+        - window.open("URL", "_blank")
+        - location.assign('URL') / location.href = 'URL'
+        """
+        patterns = [
+            r"window\\.open\(\s*['\"]([^'\"]+)['\"]",
+            r"location\\.(?:assign|replace)\(\s*['\"]([^'\"]+)['\"]",
+            r"location\\.href\s*=\s*['\"]([^'\"]+)['\"]",
+        ]
+        for pattern in patterns:
+            url_match = re.search(pattern, js_code)
+            if url_match:
+                return url_match.group(1)
+        raise ValueError("Could not find the download URL in the script.")
 
     @staticmethod
     def sanitize_filename(filename: str) -> str:
@@ -109,31 +146,109 @@ class DownloadManager:
         filename: str,
         timeout: tuple[int, int] = (60, 1200),
         max_retries: int = 6,
+        session: requests.Session | None = None,
     ) -> bool:
-        """Download a file from a URL with retries and progress tracking."""
+        """Download a file from a URL with retries, resume support, and progress tracking.
+
+        The function writes to a temporary file with the suffix ".part" and
+        atomically renames it to the final filename once the download completes.
+        On failures, the partial file is preserved so subsequent retries can
+        resume using HTTP Range requests.
+        """
+        temp_filename = f"{filename}.part"
+        chunk_size = 1048576  # 1 MB
+
+        sess = session or requests.Session()
         for retry in range(max_retries):
             try:
-                with requests.get(url, stream=True, timeout=timeout) as r:
-                    r.raise_for_status()
-                    total_size = int(r.headers.get("content-length", 0))
-                    downloaded_size = 0
-                    chunk_size = 1048576  # 1 MB
+                existing_size = os.path.getsize(temp_filename) if os.path.exists(temp_filename) else 0
+                headers = {}
+                if existing_size > 0:
+                    headers["Range"] = f"bytes={existing_size}-"
 
-                    with open(filename, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=chunk_size):
+                with sess.get(url, stream=True, timeout=timeout, headers=headers) as response:
+                    # If server does not honor Range and we already had bytes, start fresh
+                    if existing_size > 0 and response.status_code == 200:
+                        # Remove the partial and retry immediately from scratch
+                        try:
+                            os.remove(temp_filename)
+                        except OSError:
+                            pass
+                        existing_size = 0
+                        # Reissue request without Range in the same retry loop
+                        with sess.get(url, stream=True, timeout=timeout) as response_no_range:
+                            response_no_range.raise_for_status()
+                            total_from_headers = response_no_range.headers.get("content-length")
+                            total_size = int(total_from_headers) if total_from_headers and total_from_headers.isdigit() else 0
+                            downloaded_size = 0
+                            with open(temp_filename, "wb") as f:
+                                for chunk in response_no_range.iter_content(chunk_size=chunk_size):
+                                    if not chunk:
+                                        continue
+                                    f.write(chunk)
+                                    downloaded_size += len(chunk)
+                                    if total_size:
+                                        progress = ((downloaded_size) / total_size) * 100
+                                        print(
+                                            f"Downloading {os.path.basename(filename)}: {progress:.2f}% complete",
+                                            end="\r",
+                                        )
+                        os.replace(temp_filename, filename)
+                        print(f"\nFinished downloading {os.path.basename(filename)}.")
+                        return True
+
+                    response.raise_for_status()
+
+                    # Determine total size for progress
+                    total_size = 0
+                    content_range = response.headers.get("content-range")
+                    if content_range and "/" in content_range:
+                        # Format: bytes start-end/total
+                        try:
+                            total_size = int(content_range.split("/")[-1])
+                        except ValueError:
+                            total_size = 0
+                    elif response.headers.get("content-length"):
+                        try:
+                            total_size = int(response.headers.get("content-length", "0")) + existing_size
+                        except ValueError:
+                            total_size = 0
+
+                    mode = "ab" if existing_size > 0 and response.status_code in (206, 416) else "wb"
+                    downloaded_size = existing_size
+
+                    with open(temp_filename, mode) as f:
+                        for chunk in response.iter_content(chunk_size=chunk_size):
+                            if not chunk:
+                                continue
                             f.write(chunk)
                             downloaded_size += len(chunk)
-                            progress = (downloaded_size / total_size) * 100
-                            print(
-                                f"Downloading {os.path.basename(filename)}: {progress:.2f}% complete",
-                                end="\r",
-                            )
-                    print(f"\nFinished downloading {os.path.basename(filename)}.")
-                    return True
+                            if total_size:
+                                progress = (downloaded_size / total_size) * 100
+                                print(
+                                    f"Downloading {os.path.basename(filename)}: {progress:.2f}% complete",
+                                    end="\r",
+                                )
+
+                    # If we know total size and reached/exceeded it, finalize; otherwise, assume complete
+                    if not total_size or downloaded_size >= total_size:
+                        os.replace(temp_filename, filename)
+                        print(f"\nFinished downloading {os.path.basename(filename)}.")
+                        return True
+
+                    # If we are here and haven't completed, we'll retry and resume
+                    raise requests.RequestException("Connection ended before completing the file")
+
             except (requests.RequestException, OSError) as e:
                 print(
                     f"Error downloading {os.path.basename(filename)} (attempt {retry + 1}/{max_retries}): {e}"
                 )
-                if os.path.exists(filename):
-                    os.remove(filename)
+                # Exponential backoff with jitter before next retry
+                if retry + 1 < max_retries:
+                    sleep_s = min(60.0, (2 ** retry) + random.uniform(0, 1))
+                    print(f"Retrying in {sleep_s:.1f}s...")
+                    time.sleep(sleep_s)
+                # Preserve partial file for resume on next attempt
+                continue
+
         return False
